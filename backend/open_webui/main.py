@@ -388,13 +388,11 @@ async def get_content_from_response(response) -> Optional[str]:
         content = response["choices"][0]["message"]["content"]
     return content
 
-
 async def chat_completion_tools_handler(
     body: dict, user: UserModel, extra_params: dict
 ) -> tuple[dict, dict]:
     # If tool_ids field is present, call the functions
     metadata = body.get("metadata", {})
-
     tool_ids = metadata.get("tool_ids", None)
     log.debug(f"{tool_ids=}")
     if not tool_ids:
@@ -418,77 +416,96 @@ async def chat_completion_tools_handler(
     )
     log.info(f"{tools=}")
 
-    specs = [tool["spec"] for tool in tools.values()]
-    tools_specs = json.dumps(specs)
+    # Initialize a dictionary to keep track of the number of times each tool has been called
+    tool_call_counts = {tool_name: 0 for tool_name in tools}
 
-    if app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
-        template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-    else:
-        template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
+    while True:
+        # Filter out tools that have reached their max_runs limit
+        available_tools = {
+            tool_name: tool
+            for tool_name, tool in tools.items()
+            if tool_call_counts[tool_name] < tool.get("max_runs", 1)
+        }
 
-    tools_function_calling_prompt = tools_function_calling_generation_template(
-        template, tools_specs
-    )
-    log.info(f"{tools_function_calling_prompt=}")
-    payload = get_tools_function_calling_payload(
-        body["messages"], task_model_id, tools_function_calling_prompt
-    )
+        # If no tools are available, break the loop
+        if not available_tools:
+            break
 
-    try:
-        payload = filter_pipeline(payload, user)
-    except Exception as e:
-        raise e
+        specs = [tool["spec"] for tool in available_tools.values()]
+        tools_specs = json.dumps(specs)
 
-    try:
-        response = await generate_chat_completions(form_data=payload, user=user)
-        log.debug(f"{response=}")
-        content = await get_content_from_response(response)
-        log.debug(f"{content=}")
+        if app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
+            template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+        else:
+            template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
 
-        if not content:
-            return body, {}
+        tools_function_calling_prompt = tools_function_calling_generation_template(
+            template, tools_specs
+        )
+        log.info(f"{tools_function_calling_prompt=}")
+        payload = get_tools_function_calling_payload(
+            body["messages"], task_model_id, tools_function_calling_prompt
+        )
 
         try:
-            content = content[content.find("{") : content.rfind("}") + 1]
+            payload = filter_pipeline(payload, user)
+        except Exception as e:
+            raise e
+
+        try:
+            response = await generate_chat_completions(form_data=payload, user=user)
+            log.debug(f"{response=}")
+            content = await get_content_from_response(response)
+            log.debug(f"{content=}")
+
             if not content:
-                raise Exception("No JSON object found in the response")
-
-            result = json.loads(content)
-
-            tool_function_name = result.get("name", None)
-            if tool_function_name not in tools:
-                return body, {}
-
-            tool_function_params = result.get("parameters", {})
+                break
 
             try:
-                tool_output = await tools[tool_function_name]["callable"](
-                    **tool_function_params
-                )
+                content = content[content.find("{") : content.rfind("}") + 1]
+                if not content:
+                    raise Exception("No JSON object found in the response")
+
+                result = json.loads(content)
+
+                tool_function_name = result.get("name", None)
+                if tool_function_name not in available_tools:
+                    break
+
+                tool_function_params = result.get("parameters", {})
+
+                # Call the tool function
+                try:
+                    tool_output = await available_tools[tool_function_name]["callable"](
+                        **tool_function_params
+                    )
+                except Exception as e:
+                    tool_output = str(e)
+
+                if available_tools[tool_function_name]["citation"]:
+                    citations.append(
+                        {
+                            "source": {
+                                "name": f"TOOL:{available_tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                            },
+                            "document": [tool_output],
+                            "metadata": [{"source": tool_function_name}],
+                        }
+                    )
+                if available_tools[tool_function_name]["file_handler"]:
+                    skip_files = True
+
+                if isinstance(tool_output, str):
+                    contexts.append(tool_output)
+
+                # Increment the call count for the tool
+                tool_call_counts[tool_function_name] += 1
             except Exception as e:
-                tool_output = str(e)
-
-            if tools[tool_function_name]["citation"]:
-                citations.append(
-                    {
-                        "source": {
-                            "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
-                        },
-                        "document": [tool_output],
-                        "metadata": [{"source": tool_function_name}],
-                    }
-                )
-            if tools[tool_function_name]["file_handler"]:
-                skip_files = True
-
-            if isinstance(tool_output, str):
-                contexts.append(tool_output)
+                log.exception(f"Error: {e}")
+                content = None
         except Exception as e:
             log.exception(f"Error: {e}")
             content = None
-    except Exception as e:
-        log.exception(f"Error: {e}")
-        content = None
 
     log.debug(f"tool_contexts: {contexts}")
 
@@ -496,7 +513,6 @@ async def chat_completion_tools_handler(
         del body["metadata"]["files"]
 
     return body, {"contexts": contexts, "citations": citations}
-
 
 async def chat_completion_files_handler(body) -> tuple[dict, dict[str, list]]:
     contexts = []

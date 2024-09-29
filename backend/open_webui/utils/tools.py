@@ -48,6 +48,8 @@ def get_tools(
             valves = Tools.get_tool_valves_by_id(tool_id) or {}
             module.valves = module.Valves(**valves)
 
+        max_runs = module.max_runs if  hasattr(module, "max_runs") else 1
+
         if hasattr(module, "UserValves"):
             extra_params["__user__"]["valves"] = module.UserValves(  # type: ignore
                 **Tools.get_user_valves_by_id_and_user_id(tool_id, user.id)
@@ -73,6 +75,7 @@ def get_tools(
                 "spec": spec,
                 "pydantic_model": json_schema_to_model(spec),
                 "file_handler": hasattr(module, "file_handler") and module.file_handler,
+                "max_runs": max_runs,
                 "citation": hasattr(module, "citation") and module.citation,
             }
 
