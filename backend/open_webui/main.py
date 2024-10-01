@@ -419,7 +419,8 @@ async def chat_completion_tools_handler(
     # Initialize a dictionary to keep track of the number of times each tool has been called
     tool_call_counts = {tool_name: 0 for tool_name in tools}
 
-    while True:
+    max_runs_total = sum(tool.get("max_runs", 1) for tool in tools.values())
+    for _ in range(max_runs_total):
         # Filter out tools that have reached their max_runs limit
         available_tools = {
             tool_name: tool
@@ -497,6 +498,9 @@ async def chat_completion_tools_handler(
 
                 if isinstance(tool_output, str):
                     contexts.append(tool_output)
+                    payload["messages"][-1]["content"] = payload["messages"][-1]["content"] + \
+                             f"\ntool execution: {tool_function_name} \n" + \
+                             f"output:\n{tool_output}\n--\n" 
 
                 # Increment the call count for the tool
                 tool_call_counts[tool_function_name] += 1
