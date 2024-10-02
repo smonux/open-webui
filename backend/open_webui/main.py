@@ -366,7 +366,9 @@ def get_tools_function_calling_payload(messages, task_model_id, content,
         for message in tools_messages
     )
 
-    prompt = f"History:\n{history}\nQuery: {user_message}" + previous_runs
+    prompt = f"History:\n{history}\nQuery: {user_message}\n" + \
+    "TOOL RUNS (tools already executed with their output, don't retry them if you already have the info you need):\n" + \
+    previous_runs
 
     return {
         "model": task_model_id,
