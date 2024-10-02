@@ -354,14 +354,19 @@ async def chat_completion_filter_functions_handler(body, model, extra_params):
     return body, {}
 
 
-def get_tools_function_calling_payload(messages, task_model_id, content):
+def get_tools_function_calling_payload(messages, task_model_id, content,
+                                        tools_messages):
     user_message = get_last_user_message(messages)
     history = "\n".join(
         f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
         for message in messages[::-1][:4]
     )
+    previous_runs = "\n".join(
+        f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
+        for message in tools_messages
+    )
 
-    prompt = f"History:\n{history}\nQuery: {user_message}"
+    prompt = f"History:\n{history}\nQuery: {user_message}" + previous_runs
 
     return {
         "model": task_model_id,
@@ -401,6 +406,7 @@ async def chat_completion_tools_handler(
     skip_files = False
     contexts = []
     citations = []
+    tools_messages = []
 
     task_model_id = get_task_model_id(body["model"])
     tools = get_tools(
@@ -414,7 +420,13 @@ async def chat_completion_tools_handler(
             "__files__": metadata.get("files", []),
         },
     )
+    
     log.info(f"{tools=}")
+    if app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
+        template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+    else:
+        template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
+
 
     # Initialize a dictionary to keep track of the number of times each tool has been called
     tool_call_counts = {tool_name: 0 for tool_name in tools}
@@ -434,18 +446,14 @@ async def chat_completion_tools_handler(
 
         specs = [tool["spec"] for tool in available_tools.values()]
         tools_specs = json.dumps(specs)
-
-        if app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
-            template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
-        else:
-            template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
-
+        
         tools_function_calling_prompt = tools_function_calling_generation_template(
             template, tools_specs
         )
         log.info(f"{tools_function_calling_prompt=}")
         payload = get_tools_function_calling_payload(
-            body["messages"], task_model_id, tools_function_calling_prompt
+            body["messages"], task_model_id,
+             tools_function_calling_prompt, tools_messages
         )
 
         try:
@@ -498,9 +506,8 @@ async def chat_completion_tools_handler(
 
                 if isinstance(tool_output, str):
                     contexts.append(tool_output)
-                    payload["messages"][-1]["content"] = payload["messages"][-1]["content"] + \
-                             f"\ntool execution: {tool_function_name} \n" + \
-                             f"output:\n{tool_output}\n--\n" 
+                    tools_messages.append({ "role": f"tool {tool_function_name}",
+                                            "content" : f"{tool_output}"})
 
                 # Increment the call count for the tool
                 tool_call_counts[tool_function_name] += 1
