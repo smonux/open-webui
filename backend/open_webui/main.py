@@ -427,7 +427,7 @@ async def chat_completion_tools_handler(
     if app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE != "":
         template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
     else:
-        template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
+        template = """Available Tools: {{TOOLS}}\nReturn an empty string if no tools match the query or if the appropiate tools have already been called and it's possible to answer the query with the avalaible information. If a function tool matches, construct and return a JSON object in the format {\"name\": \"functionName\", \"parameters\": {\"requiredFunctionParamKey\": \"requiredFunctionParamValue\"}} using the appropriate tool and its parameters. Only return the object and limit the response to the JSON object without additional text."""
 
 
     # Initialize a dictionary to keep track of the number of times each tool has been called
