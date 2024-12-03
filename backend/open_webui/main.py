@@ -9,7 +9,7 @@ import sys
 import time
 import random
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 from aiocache import cached
 import aiohttp
@@ -32,7 +32,7 @@ from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import AsyncContentStream, Response, StreamingResponse
 
 from open_webui.apps.audio.main import app as audio_app
 from open_webui.apps.images.main import app as images_app
@@ -364,9 +364,317 @@ async def get_content_from_response(response) -> Optional[str]:
         # Cleanup any remaining background tasks if necessary
         if response.background is not None:
             await response.background()
-    else:
+    elif hasattr(response, "choices"):
         content = response["choices"][0]["message"]["content"]
     return content
+
+
+def get_tools_body(
+    body: dict, user: UserModel, extra_params: dict, models
+) -> tuple[dict, dict]:
+    metadata = body.get("metadata", {})
+
+    tool_ids = metadata.get("tool_ids", None)
+    log.debug(f"{tool_ids=}")
+    if not tool_ids:
+        return body, {}
+
+    task_model_id = get_task_model_id(
+        body["model"],
+        app.state.config.TASK_MODEL,
+        app.state.config.TASK_MODEL_EXTERNAL,
+        models,
+    )
+
+    tools = get_tools(
+        webui_app,
+        tool_ids,
+        user,
+        {
+            **extra_params,
+            "__model__": models[task_model_id],
+            "__messages__": body["messages"],
+            "__files__": metadata.get("files", []),
+        },
+    )
+    log.info(f"{tools=}")
+
+    specs = [tool["spec"] for tool in tools.values()]
+
+    tools_args = [{"type": "function", "function": spec} for spec in specs]
+    body["tools"] = tools_args
+
+    return body, tools
+
+
+def update_body_request(request: Request, body: dict) -> None:
+    modified_body_bytes = json.dumps(body).encode("utf-8")
+    # Replace the request body with the modified one
+    request._body = modified_body_bytes
+    # Set custom header to ensure content-length matches new body length
+    request.headers.__dict__["_list"] = [
+        (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
+        *[(k, v) for k, v in request.headers.raw if k.lower() != b"content-length"],
+    ]
+    return None
+
+
+def extract_json(s: str) -> Optional[dict]:
+    try:
+        return json.loads(s[s.find("{") : s.rfind("}") + 1])
+    except Exception:
+        return None
+
+
+def fill_with_delta(fcall_dict: dict, delta: dict) -> None:
+
+    if fcall_dict == {}:
+        fcall_dict.update(
+            {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            }
+        )
+
+    if "delta" not in delta.get("choices", [{}])[0]:
+        return
+    j = delta["choices"][0].get("delta", {}).get("tool_calls", [{}])[0]
+    if "id" in j:
+        fcall_dict["id"] += j.get("id", "") or ""
+    if "function" in j:
+        fcall_dict["function"]["name"] += j["function"].get("name", "")
+        fcall_dict["function"]["arguments"] += j["function"].get("arguments", "")
+
+
+async def process_tool_calls(
+    tool_calls: list, citations: list, messages: list, tools: dict
+) -> None:
+    for tool_call in tool_calls:
+        # fix for cohere
+        if "index" in tool_call:
+            del tool_call["index"]
+
+        tool_function_name = tool_call["function"]["name"]
+        tool_function_params = {}
+        args = tool_call["function"]["arguments"]
+        if isinstance(args, str):
+            tool_function_params = json.loads(args) if args else {}
+        elif isinstance(args, dict):
+            tool_function_params = args
+        else:
+            raise Exception(f"Unexpected arguments {args=}")
+
+        log.debug(f"calling {tool_function_name} with params {tool_function_params}")
+        try:
+            tool_output = await tools[tool_function_name]["callable"](
+                **tool_function_params
+            )
+        except Exception as e:
+            tool_output = str(e)
+
+        if tools.get(tool_function_name, {}).get("citation", False):
+            citations.append(
+                {
+                    "source": {
+                        "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                    },
+                    "document": [tool_output],
+                    "metadata": [{"source": tool_function_name}],
+                }
+            )
+
+        # Append the tool output to the messages
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.get("id", ""),
+                "name": tool_function_name,
+                "content": tool_output,
+            }
+        )
+
+
+async def handle_streaming_response(
+    request: Request,
+    response: StreamingResponse,
+    tools: dict,
+    data_items: list,
+    user: UserModel,
+) -> StreamingResponse:
+    content_type = response.headers["Content-Type"]
+    is_openai = "text/event-stream" in content_type
+
+    def wrap_item(item):
+        return f"data: {item}\n\n" if is_openai else f"{item}\n"
+
+    async def stream_wrapper(
+        original_generator: AsyncContentStream, data_items: list[dict]
+    ):
+        for item in data_items:
+            yield wrap_item(json.dumps(item))
+
+        citations = []
+        body = json.loads(request._body)
+        generator = original_generator
+        buffered_content = ""
+        try:
+            while True:
+                peek = await anext(generator)
+                peek = peek.decode("utf-8") if isinstance(peek, bytes) else peek
+                if peek == "data: [DONE]\n" and len(citations) > 0:
+                    yield wrap_item(json.dumps({"sources": citations}))
+                    yield peek
+                    continue
+
+                peek_json = extract_json(peek)
+                if peek_json is None or "choices" not in peek_json:
+                    log.debug("Non json data received: {peek=}")
+                    yield peek
+                    continue
+
+                if "tool_calls" not in peek_json["choices"][0]["delta"]:
+                    content = peek_json["choices"][0]["delta"].get("content", "")
+                    buffered_content += content if content else ""
+                    yield peek
+                    continue
+
+                # We reached a tool call so we have to consume all the messages to assemble it
+                log.debug("async tool call detected")
+                tool_calls = []  # id, name, arguments
+                tool_calls.append({})
+                current_index = peek_json["choices"][0]["delta"]["tool_calls"][0][
+                    "index"
+                ]
+                fill_with_delta(tool_calls[current_index], peek_json)
+
+                async for data in generator:
+                    delta = extract_json(
+                        data.decode("utf-8") if isinstance(data, bytes) else data
+                    )
+
+                    if (
+                        delta is None
+                        or "choices" not in delta
+                        or "tool_calls" not in delta["choices"][0]["delta"]
+                        or delta["choices"][0].get("finish_reason", None) is not None
+                    ):
+                        continue
+
+                    i = delta["choices"][0]["delta"]["tool_calls"][0]["index"]
+                    if i != current_index:
+                        tool_calls.append({})
+                        current_index = i
+
+                    fill_with_delta(tool_calls[i], delta)
+
+                log.debug(
+                    f"tools to call { [ t['function']['name'] for t in tool_calls] }"
+                )
+
+                if buffered_content:
+                    body["messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": buffered_content,
+                            "refusal": None,
+                        }
+                    )
+                    buffered_content = ""
+
+                body["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "refusal": None,
+                        "tool_calls": tool_calls,
+                    }
+                )
+
+                await process_tool_calls(
+                    tool_calls=tool_calls,
+                    citations=citations,
+                    messages=body["messages"],
+                    tools=tools,
+                )
+                # Make another request to the model with the updated context
+                log.debug("calling the model again with tool output included")
+                update_body_request(request, body)
+                response = await generate_chat_completions(form_data=body, user=user)
+                if isinstance(response, StreamingResponse):
+                    # body_iterator here does not have __anext_() so it has to be done this way
+                    generator = (x async for x in response.body_iterator)
+                else:
+                    raise Exception(f"{response=} is not a StreamingResponse")
+
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            log.exception(f"Error: {e}")
+
+    return StreamingResponse(
+        stream_wrapper(response.body_iterator, data_items),
+        headers=dict(response.headers),
+    )
+
+
+async def handle_nonstreaming_response(
+    request: Request,
+    response: StreamingResponse,
+    tools: dict,
+    user: UserModel,
+    models,
+) -> JSONResponse:
+    # It only should be one response since we are in the non streaming scenario
+    content = ""
+    async for data in response.body_iterator:
+        content += data.decode("utf-8") if isinstance(data, bytes) else data
+    citations = []
+    response_dict: dict = json.loads(content)
+    body = json.loads(request._body)
+
+    is_ollama = False
+    if models[body["model"]]["owned_by"] == "ollama":
+        is_ollama = True
+    is_openai = not is_ollama
+
+    def get_message_ollama(d: dict) -> dict:
+        return d.get("message", {})
+
+    def get_message_openai(d: dict) -> dict:
+        return d.get("choices", [{}])[0].get("message", {})
+
+    get_message = get_message_ollama if is_ollama else get_message_openai
+
+    content = ""
+    while "tool_calls" in get_message(response_dict):
+        message = get_message(response_dict)
+        tool_calls = []
+        content += message.get("content", "") or ""
+        tool_calls = message.get("tool_calls", [])
+        body["messages"].append(message)
+
+        await process_tool_calls(
+            tool_calls=tool_calls,
+            citations=citations,
+            messages=body["messages"],
+            tools=tools,
+        )
+        # Make another request to the model with the updated context
+        update_body_request(request, body)
+        untyped_response = await generate_chat_completions(
+            form_data=body, user=user, as_openai=is_openai
+        )
+        if not isinstance(untyped_response, dict):
+            raise Exception(
+                f"Expecting dict from generate_chat_completions got {untyped_response=}"
+            )
+        response_dict = untyped_response
+
+    message = get_message(response_dict)
+    message["content"] = content + " " + message.get("content", "")
+    # FIXME: is it possible to handle citations?
+    return JSONResponse(content=response_dict)
 
 
 def get_task_model_id(
@@ -386,7 +694,7 @@ def get_task_model_id(
 
 
 async def chat_completion_tools_handler(
-    body: dict, user: UserModel, models, extra_params: dict
+    body: dict, user: UserModel, extra_params: dict, models: dict
 ) -> tuple[dict, dict]:
     # If tool_ids field is present, call the functions
     metadata = body.get("metadata", {})
@@ -530,6 +838,7 @@ async def chat_completion_tools_handler(
 async def chat_completion_files_handler(
     body: dict, user: UserModel
 ) -> tuple[dict, dict[str, list]]:
+
     sources = []
 
     if files := body.get("metadata", {}).get("files", None):
@@ -657,6 +966,7 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
             "session_id": body.pop("session_id", None),
             "tool_ids": body.get("tool_ids", None),
             "files": body.get("files", None),
+            "native_tool_call": body.pop("native_tool_call", False),
         }
         body["metadata"] = metadata
 
@@ -697,13 +1007,29 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
         }
         body["metadata"] = metadata
 
-        try:
-            body, flags = await chat_completion_tools_handler(
-                body, user, models, extra_params
+        body, tools = get_tools_body(body, user, extra_params, models)
+
+        if (
+            model["owned_by"] == "ollama"
+            and body["metadata"]["native_tool_call"]
+            and body.get("stream", False)
+        ):
+            log.info(
+                "Ollama models don't support function calling in streaming yet. forcing native_tool_call to False"
             )
-            sources.extend(flags.get("sources", []))
-        except Exception as e:
-            log.exception(e)
+            body["metadata"]["native_tool_call"] = False
+
+        if not body["metadata"]["native_tool_call"]:
+            if "tools" in body:
+                # we won't use those they are only for native_tool_call =True
+                del body["tools"]
+            try:
+                body, flags = await chat_completion_tools_handler(
+                    body, user, extra_params, models
+                )
+                sources.extend(flags.get("sources", []))
+            except Exception as e:
+                log.exception(e)
 
         try:
             body, flags = await chat_completion_files_handler(body, user)
@@ -741,7 +1067,7 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
                 and context_string.strip() == ""
             ):
                 log.debug(
-                    f"With a 0 relevancy threshold for RAG, the context cannot be empty"
+                    "With a 0 relevancy threshold for RAG, the context cannot be empty"
                 )
 
             # Workaround for Ollama 2.0+ system prompt issue
@@ -768,39 +1094,47 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
         if len(sources) > 0:
             data_items.append({"sources": sources})
 
-        modified_body_bytes = json.dumps(body).encode("utf-8")
-        # Replace the request body with the modified one
-        request._body = modified_body_bytes
-        # Set custom header to ensure content-length matches new body length
-        request.headers.__dict__["_list"] = [
-            (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
-            *[(k, v) for k, v in request.headers.raw if k.lower() != b"content-length"],
-        ]
-
+        update_body_request(request, body)
         response = await call_next(request)
+
         if not isinstance(response, StreamingResponse):
             return response
 
-        content_type = response.headers["Content-Type"]
-        is_openai = "text/event-stream" in content_type
-        is_ollama = "application/x-ndjson" in content_type
-        if not is_openai and not is_ollama:
-            return response
+        if not body["metadata"]["native_tool_call"]:
+            content_type = response.headers["Content-Type"]
+            is_openai = "text/event-stream" in content_type
+            is_ollama = "application/x-ndjson" in content_type
+            if not is_openai and not is_ollama:
+                return response
 
-        def wrap_item(item):
-            return f"data: {item}\n\n" if is_openai else f"{item}\n"
+            def wrap_item(item):
+                return f"data: {item}\n\n" if is_openai else f"{item}\n"
 
-        async def stream_wrapper(original_generator, data_items):
-            for item in data_items:
-                yield wrap_item(json.dumps(item))
+            async def stream_wrapper(original_generator, data_items):
+                for item in data_items:
+                    yield wrap_item(json.dumps(item))
 
-            async for data in original_generator:
-                yield data
+                async for data in original_generator:
+                    yield data
 
-        return StreamingResponse(
-            stream_wrapper(response.body_iterator, data_items),
-            headers=dict(response.headers),
-        )
+            return StreamingResponse(
+                stream_wrapper(response.body_iterator, data_items),
+                headers=dict(response.headers),
+            )
+        else:
+
+            skip_files = all(["file_handler" in t for t in tools])
+            if skip_files and "files" in body.get("metadata", {}):
+                del body["metadata"]["files"]
+
+            if not body.get("stream", False):
+                return await handle_nonstreaming_response(
+                    request, response, tools, user, models
+                )
+            else:
+                return await handle_streaming_response(
+                    request, response, tools, data_items, user
+                )
 
     async def _receive(self, body: bytes):
         return {"type": "http.request", "body": body, "more_body": False}
@@ -1264,7 +1598,10 @@ async def get_base_models(user=Depends(get_admin_user)):
 
 @app.post("/api/chat/completions")
 async def generate_chat_completions(
-    form_data: dict, user=Depends(get_verified_user), bypass_filter: bool = False
+    form_data: dict,
+    user=Depends(get_verified_user),
+    bypass_filter: bool = False,
+    as_openai: bool = False,
 ):
     model_list = await get_all_models()
     models = {model["id"]: model for model in model_list}
@@ -1362,6 +1699,7 @@ async def generate_chat_completions(
     if model["owned_by"] == "ollama":
         # Using /ollama/api/chat endpoint
         form_data = convert_payload_openai_to_ollama(form_data)
+        log.debug(f"{form_data=}")
         form_data = GenerateChatCompletionForm(**form_data)
         response = await generate_ollama_chat_completion(
             form_data=form_data, user=user, bypass_filter=bypass_filter
@@ -1369,11 +1707,17 @@ async def generate_chat_completions(
         if form_data.stream:
             response.headers["content-type"] = "text/event-stream"
             return StreamingResponse(
-                convert_streaming_response_ollama_to_openai(response),
+                (
+                    convert_streaming_response_ollama_to_openai(response)
+                    if as_openai
+                    else response
+                ),
                 headers=dict(response.headers),
             )
         else:
-            return convert_response_ollama_to_openai(response)
+            return (
+                convert_response_ollama_to_openai(response) if as_openai else response
+            )
     else:
         return await generate_openai_chat_completion(
             form_data, user=user, bypass_filter=bypass_filter
@@ -1938,13 +2282,13 @@ async def generate_queries(form_data: dict, user=Depends(get_verified_user)):
         if not app.state.config.ENABLE_SEARCH_QUERY_GENERATION:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Search query generation is disabled",
+                detail="Search query generation is disabled",
             )
     elif type == "retrieval":
         if not app.state.config.ENABLE_RETRIEVAL_QUERY_GENERATION:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Query generation is disabled",
+                detail="Query generation is disabled",
             )
 
     model_list = await get_all_models()
